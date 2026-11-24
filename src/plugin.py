@@ -1,245 +1,262 @@
 # for localized messages
 from . import _, group_titles
 
+from hashlib import md5
 from os import makedirs as os_makedirs, path as os_path, remove as os_remove
+from re import search as re_search
 from requests import get, exceptions
 from shutil import rmtree
 from time import time
-import pickle
+from xml.sax.saxutils import escape as xml_escape
 
-from enigma import eDVBDB, eTimer
+from enigma import eDVBDB
 
 from Components.ActionMap import ActionMap
-from Components.config import config, ConfigSubsection, ConfigSelection, ConfigText, configfile
-from Components.SelectionList import SelectionList, SelectionEntryComponent
+from Components.config import config, ConfigSelection, ConfigSubsection, getConfigListEntry
+from Components.ConfigList import ConfigListScreen
+from Components.Label import Label
 from Components.Sources.StaticText import StaticText
 from Plugins.Plugin import PluginDescriptor
-from Screens.ChoiceBox import ChoiceBox
 from Screens.MessageBox import MessageBox
-from Screens.Screen import Screen, ScreenSummary
-from Tools.Directories import sanitizeFilename
-
+from Screens.Screen import Screen
 
 config.plugins.iptv_org = ConfigSubsection()
-choices = {"genre": _("genre"), "language": _("language"), "country": _("country")}
-config.plugins.iptv_org.current = ConfigSelection(choices=[(x[0], x[1]) for x in choices.items()], default=list(choices.keys())[0])
-for choice in choices:
-	setattr(config.plugins.iptv_org, choice, ConfigText("", False))
+choices = {
+	"country": _("Country"),
+	"genre": _("Category"),
+	"language": _("Language"),
+}
+config.plugins.iptv_org.current = ConfigSelection(default="country", choices=list(choices.items()))
+
+
+def make_service_ref(tvg_id, url, channelname):
+	stype = "5002" if os_path.exists("/usr/bin/exteplayer3") else "4097"
+	key = (tvg_id or channelname).encode("utf-8", errors="ignore")
+	digest = md5(key).hexdigest()
+	sid = int(digest[0:4], 16) or 1
+	tsid = int(digest[4:8], 16) or 1
+	onid = int(digest[8:12], 16) or 1
+	sref_epg = "%s:0:1:%X:%X:%X:CCCC0000:0:0:0:" % (stype, sid, tsid, onid)
+	sref_bouquet = "%s%s:%s" % (sref_epg, url.replace(":", "%3a"), channelname)
+	return sref_epg, sref_bouquet
+
+
+def write_epgimport_files(channel_map):
+	if not channel_map or not os_path.isdir("/etc/epgimport"):
+		return
+	channels_file = "/etc/epgimport/iptv-org.channels.xml"
+	sources_file = "/etc/epgimport/iptv-org.sources.xml"
+
+	existing = {}
+	if os_path.exists(channels_file):
+		try:
+			with open(channels_file, "r", encoding="utf-8", errors="ignore") as f:
+				for line in f:
+					m = re_search(r'<channel id="([^"]+)">([^<]+)</channel>', line)
+					if m:
+						existing[m.group(1)] = m.group(2)
+		except Exception:
+			pass
+
+	existing.update(channel_map)
+
+	with open(channels_file, "w", encoding="utf-8") as f:
+		f.write('<?xml version="1.0" encoding="utf-8"?>\n<channels>\n')
+		for cid, sref in sorted(existing.items()):
+			f.write('  <channel id="%s">%s</channel>\n' % (xml_escape(cid), xml_escape(sref)))
+		f.write("</channels>\n")
+
+	guides = [
+		("Brazil (mi.tv)", "https://github.io"),
+		("Brazil (Claro TV+)", "https://github.io"),
+		("Portugal (MEO)", "https://github.io"),
+		("USA (TVGuide)", "https://github.io"),
+		("Spain (Movistar+)", "https://github.io"),
+		("Latin America (gatotv)", "https://github.io"),
+	]
+
+	with open(sources_file, "w", encoding="utf-8") as f:
+		f.write('<?xml version="1.0" encoding="utf-8"?>\n<sources>\n')
+		f.write('  <sourcecat sourcecatname="IPTV-ORG Universal EPG">\n')
+		for label, url in guides:
+			f.write('    <source type="gen_xmltv" nocheck="1" channels="%s">\n' % channels_file)
+			f.write("      <description>iptv-org - %s</description>\n" % xml_escape(label))
+			f.write("      <url>%s</url>\n" % xml_escape(url))
+			f.write("    </source>\n")
+		f.write("  </sourcecat>\n</sources>\n")
 
 
 class Fetcher():
 	def __init__(self):
-		self.tempDir = "/tmp/iptv-org"
-		os_makedirs(self.tempDir, exist_ok=True)
-		self.cachefile = "/tmp/iptv-org.cache"
-		self.playlists = {"country": "https://iptv-org.github.io/iptv/index.country.m3u", "genre": "https://iptv-org.github.io/iptv/index.category.m3u", "language": "https://iptv-org.github.io/iptv/index.language.m3u"}
-		self.bouquetFilename = "userbouquet.iptv-org.%s.tv"
 		self.bouquetName = _("iptv-org")
-		self.playlists_processed = {key: {} for key in self.playlists.keys()}
-		self.cache_updated = False
+		self.bouquetFilename = "userbouquet.iptv_org.%s.tv"
+		self.tempDir = "/tmp/iptv-org"
+		self.playlists = {
+			"country": "https://github.io",
+			"genre": "https://github.io",
+			"language": "https://github.io",
+		}
+		self.cachefile = "/tmp/iptv-org.cache"
+		self.cache = {}
 		if os_path.exists(self.cachefile):
-			try:
-				mtime = os_path.getmtime(self.cachefile)
-				if mtime < time() - 86400:  # if file is older than one day delete it
+			if time() - os_path.getmtime(self.cachefile) > 86400:
+				try:
 					os_remove(self.cachefile)
-				else:
-					with open(self.cachefile, 'rb') as cache_input:
-						self.playlists_processed = pickle.load(cache_input)
-			except Exception as e:
-				print("[iptv-org plugin] failed to open cache file", e)
+				except OSError:
+					pass
+			else:
+				try:
+					with open(self.cachefile, "r", encoding="utf-8") as f:
+						self.cache = eval(f.read())
+				except Exception:
+					pass
 
 	def downloadPage(self):
 		os_makedirs(self.tempDir, exist_ok=True)
 		link = self.playlists[config.plugins.iptv_org.current.value]
 		try:
-			response = get(link, timeout=2.50)
+			response = get(link, timeout=(5.0, 15.0))
 			response.raise_for_status()
 			with open(self.tempDir + "/" + config.plugins.iptv_org.current.value, "wb") as f:
 				f.write(response.content)
-		except exceptions.RequestException as error:
-			print("[iptv-org plugin] failed to download", link)
+		except exceptions.RequestException as e:
+			print("[iptv-org] Error downloading playlist:", e)
 
 	def getPlaylist(self):
-		current = self.playlists_processed[config.plugins.iptv_org.current.value]
-		if not current:
+		if config.plugins.iptv_org.current.value not in self.cache:
 			self.downloadPage()
-			known_urls = []
+			current = {}
 			group_title = ""
 			channelname = ""
-			url = ""
-			with open(self.tempDir + "/" + config.plugins.iptv_org.current.value, encoding='utf-8', errors="ignore") as f:
+			tvg_id = ""
+			fpath = self.tempDir + "/" + config.plugins.iptv_org.current.value
+			if not os_path.exists(fpath):
+				return
+			with open(fpath, encoding="utf-8", errors="ignore") as f:
 				for line in f:
 					if line.startswith("#EXTINF:"):
 						group_title = ""
 						channelname = ""
-						url = ""
-						if len(line_split := line.rsplit(",", 1)) > 1:
-							channelname = line_split[1].strip()  # .rsplit("(", 1)[0].strip()
-							if len(line_split2 := line_split[0].split('group-title="', 1)) > 1:
-								group_title = line_split2[1].split('"', 1)[0].strip()
+						tvg_id = ""
+						m_grp = re_search(r'group-title="([^"]*)"', line)
+						if m_grp:
+							group_title = m_grp.group(1)
+						m_id = re_search(r'tvg-id="([^"]*)"', line)
+						if m_id:
+							tvg_id = m_id.group(1).strip()
+						if "," in line:
+							channelname = line.rsplit(",", 1)[1].strip()
 					elif line.startswith("http"):
 						url = line.strip()
-					if channelname and group_title and url and url not in known_urls:
-						if group_title not in current:
-							current[group_title] = []
-						current[group_title].append((channelname, url))
-						known_urls.append(url)
-						group_title = ""
-						channelname = ""
-						url = ""
-				self.cache_updated = True
+						if group_title and channelname and url:
+							if group_title not in current:
+								current[group_title] = []
+							current[group_title].append((channelname, url, tvg_id))
+			rmtree(self.tempDir, ignore_errors=True)
+			if current:
+				self.cache[config.plugins.iptv_org.current.value] = current
+				try:
+					with open(self.cachefile, "w", encoding="utf-8") as f:
+						f.write(repr(self.cache))
+				except Exception:
+					pass
 
-	def createBouquet(self, enabled):
-		current = self.playlists_processed[config.plugins.iptv_org.current.value]
-		for group_title in sorted([k for k in current.keys() if k in enabled], key=lambda x: group_titles.get(x, x).lower()):
-			bouquet_list = []
-			if current[group_title]:  # group_title not empty (how could it be)
-				bouquet_list.append("1:64:0:0:0:0:0:0:0:0:%s" % group_titles.get(group_title, group_title))
-				for channelname, url in sorted(current[group_title]):
-					bouquet_list.append("4097:0:1:1:1:1:CCCC0000:0:0:0:%s:%s" % (url.replace(":", "%3a"), channelname))
-			if bouquet_list:
-				duplicated_translation = list(group_titles.values()).count(group_titles.get(group_title, group_title)) > 1
-				eDVBDB.getInstance().addOrUpdateBouquet(self.bouquetName + (" - " + choices[config.plugins.iptv_org.current.value] if duplicated_translation else "") + " - " + group_titles.get(group_title, group_title), self.bouquetFilename % (sanitizeFilename(group_title).replace(" ", "_").strip().lower(),), bouquet_list, False)
+	def createBouquet(self, group_title):
+		current = self.cache.get(config.plugins.iptv_org.current.value, {})
+		bouquet_list = []
+		epg_map = {}
+		if group_title in current and current[group_title]:
+			bouquet_list.append("1:64:0:0:0:0:0:0:0:0:%s" % group_titles.get(group_title, group_title))
+			for item in sorted(current[group_title]):
+				channelname = item[0]
+				url = item[1]
+				tvg_id = item[2] if len(item) > 2 else ""
+				sref_epg, sref_bouquet = make_service_ref(tvg_id, url, channelname)
+				bouquet_list.append(sref_bouquet)
+				if tvg_id:
+					epg_map[tvg_id] = sref_epg
+		if bouquet_list:
+			duplicated_translation = list(group_titles.values()).count(group_titles.get(group_title, group_title)) > 1
+			eDVBDB.getInstance().addOrUpdateBouquet(
+				self.bouquetName + (" - " + choices[config.plugins.iptv_org.current.value] if duplicated_translation else "") + " - " + group_titles.get(group_title, group_title),
+				self.bouquetFilename % (sanitizeFilename(group_title).replace(" ", "_").strip().lower(),),
+				bouquet_list,
+				False,
+			)
+			write_epgimport_files(epg_map)
 
-	def cleanup(self):
-		rmtree(self.tempDir)
-		if self.cache_updated:
-			with open(self.cachefile, 'wb') as cache_output:
-				pickle.dump(self.playlists_processed, cache_output, pickle.HIGHEST_PROTOCOL)
+
+def sanitizeFilename(filename):
+	return "".join(c for c in filename if c.isalnum() or c in (" ", ".", "_")).rstrip()
 
 
-class PluginSetup(Screen):
+class IptvOrgPlaylists(ConfigListScreen, Screen, Fetcher):
 	def __init__(self, session):
 		Screen.__init__(self, session)
-		self.title = _("iptv-org playlists") + " - " + choices.get(config.plugins.iptv_org.current.value, config.plugins.iptv_org.current.value).title()
-		self.skinName = ["Setup"]
-		self.enabled = []
-		self.options = []
-		self.fetcher = Fetcher()
-		self.keyBlueText = _("Change category")
-		self["config"] = SelectionList([], enableWrapAround=True)
-		self["key_red"] = StaticText(_("Cancel"))
-		self["key_green"] = StaticText(_("Create bouquets"))
-		self["key_yellow"] = StaticText(_("Toggle all"))
-		self["key_blue"] = StaticText(self.keyBlueText)
-		self["description"] = StaticText("")
-		self["actions"] = ActionMap(["SetupActions", "ColorActions"],
-		{
-			"ok": self["config"].toggleSelection,
-			"save": self.keyCreate,
-			"cancel": self.keyCancel,
-			"yellow": self["config"].toggleAllSelection,
-			"blue": self.keyCategory,
-		}, -2)
-		self.loading_message = _("Downloading playlist - Please wait!")
-		self["description"].text = self.loading_message
-		self.onClose.append(self.__onClose)
-		self.timer = eTimer()
-		self.timer.callback.append(self.buildList)
-		self.timer.start(10, 1)
-
-	def __onClose(self):
-		self.fetcher.cleanup()
-
-	def buildList(self):
-		self["actions"].setEnabled(False)
-		self.fetcher.getPlaylist()  # get playlist is not already local              group_titles.get(x, x)
-		self.options = sorted(list(self.fetcher.playlists_processed[config.plugins.iptv_org.current.value].keys()), key=lambda x: group_titles.get(x, x).lower())
-		self.enabled = [x for x in getattr(config.plugins.iptv_org, config.plugins.iptv_org.current.value).value.split("|") if x in self.options]
-		self["config"].setList([SelectionEntryComponent(group_titles.get(x, x), x, "", x in self.enabled) for x in self.options])
-		self["actions"].setEnabled(True)
-		self["description"].text = ""
-
-	def readList(self):
-		self.enabled = [x[0][1] for x in self["config"].list if x[0][3]]
-		getattr(config.plugins.iptv_org, config.plugins.iptv_org.current.value).value = "|".join(self.enabled)
-
-	def keyCreate(self):
-		self.readList()
-		if self.enabled:
-			self["actions"].setEnabled(False)
-			self.title += " - " + _("Creating bouquets")
-			self["description"].text = _("Creating bouquets. This may take some time. Please be patient.")
-			self["key_red"].text = ""
-			self["key_green"].text = ""
-			self["key_yellow"].text = ""
-			self["key_blue"].text = ""
-			self["config"].setList([])
-			config.plugins.iptv_org.current.save()
-			for choice in choices:
-				getattr(config.plugins.iptv_org, choice).save()
-			configfile.save()
-			self.runtimer = eTimer()
-			self.runtimer.callback.append(self.doRun)
-			self.runtimer.start(10, 1)
-		else:
-			self.session.open(MessageBox, _("Please select the bouquets you wish to create"))
-
-	def doRun(self):
-		self.fetcher.createBouquet(self.enabled)
-		self.close()
-
-	def keyCancel(self):
-		self.readList()
-		if any([getattr(config.plugins.iptv_org, choice).isChanged() for choice in choices]):
-			self.session.openWithCallback(self.cancelConfirm, MessageBox, _("Really close without saving settings?"))
-		else:
-			self.close()
-
-	def keyCategory(self):
-		current = config.plugins.iptv_org.current
-		self.session.openWithCallback(
-			self.keyCategoryCallback, ChoiceBox, title=self.keyBlueText,
-			list=list(zip(current.description, current.choices)),
-			selection=current.getIndex(),
-			keys=[]
+		Fetcher.__init__(self)
+		self.skinName = ["IptvOrgPlaylists", "Setup"]
+		self.setTitle(_("iptv-org playlists"))
+		self["key_red"] = StaticText(_("Exit"))
+		self["key_green"] = StaticText(_("Create bouquet"))
+		self["key_yellow"] = StaticText(_("Delete cache"))
+		self["description"] = Label("")
+		self["actions"] = ActionMap(
+			["SetupActions", "ColorActions"],
+			{
+				"cancel": self.keyCancel,
+				"ok": self.keyGreen,
+				"green": self.keyGreen,
+				"yellow": self.keyYellow,
+			},
+			-2,
 		)
+		self.list = []
+		ConfigListScreen.__init__(self, self.list, session=session, on_change=self.changedEntry)
+		self.createSetup()
 
-	def keyCategoryCallback(self, answer):
-		if answer:
-			config.plugins.iptv_org.current.value = answer[1]
-			self.title = _("iptv-org playlists") + " - " + choices.get(config.plugins.iptv_org.current.value, config.plugins.iptv_org.current.value).title()
-			self["description"].text = self.loading_message
-			self["config"].setList([])
-			self.timer.start(10, 1)
+	def createSetup(self):
+		self.getPlaylist()
+		current = self.cache.get(config.plugins.iptv_org.current.value, {})
+		group_choices = [(k, "%s (%d)" % (group_titles.get(k, k), len(v))) for k, v in sorted(current.items(), key=lambda x: group_titles.get(x[0], x[0]).lower())]
+		if not group_choices:
+			group_choices = [("", _("No playlists available"))]
+		self.group_config = ConfigSelection(choices=group_choices)
+		self.list = [
+			getConfigListEntry(_("Sort playlists by"), config.plugins.iptv_org.current, _("Select whether to group playlists by country, category, or language.")),
+			getConfigListEntry(_("Select playlist"), self.group_config, _("Press OK or Green to create/update the bouquet and EPGImport mapping.")),
+		]
+		self["config"].list = self.list
 
-	def cancelConfirm(self, result):
-		if not result:
-			return
-		config.plugins.iptv_org.current.cancel()
-		for choice in choices:
-			getattr(config.plugins.iptv_org, choice).cancel()
-		self.close()
+	def changedEntry(self):
+		if self["config"].getCurrent()[1] == config.plugins.iptv_org.current:
+			self.createSetup()
 
-	def createSummary(self):
-		return PluginSummary
+	def keyGreen(self):
+		if self.group_config.value:
+			self.createBouquet(self.group_config.value)
+			self.session.open(MessageBox, _("Bouquet and EPGImport channels created for %s!") % group_titles.get(self.group_config.value, self.group_config.value), MessageBox.TYPE_INFO, timeout=5)
 
-
-class PluginSummary(ScreenSummary):
-	def __init__(self, session, parent):
-		ScreenSummary.__init__(self, session, parent=parent)
-		self.skinName = "PluginBrowserSummary"
-		self["entry"] = StaticText("")
-		if self.addWatcher not in self.onShow:
-			self.onShow.append(self.addWatcher)
-		if self.removeWatcher not in self.onHide:
-			self.onHide.append(self.removeWatcher)
-
-	def addWatcher(self):
-		if self.selectionChanged not in self.parent["config"].onSelectionChanged:
-			self.parent["config"].onSelectionChanged.append(self.selectionChanged)
-		self.selectionChanged()
-
-	def removeWatcher(self):
-		if self.selectionChanged in self.parent["config"].onSelectionChanged:
-			self.parent["config"].onSelectionChanged.remove(self.selectionChanged)
-
-	def selectionChanged(self):
-		self["entry"].text = item[0][0] if (item := (self.parent["config"].getCurrent())) else ""
+	def keyYellow(self):
+		if os_path.exists(self.cachefile):
+			try:
+				os_remove(self.cachefile)
+			except OSError:
+				pass
+		self.cache = {}
+		self.createSetup()
+		self.session.open(MessageBox, _("Cache cleared and playlists reloaded."), MessageBox.TYPE_INFO, timeout=3)
 
 
-def PluginMain(session, **kwargs):
-	return session.open(PluginSetup)
+def main(session, **kwargs):
+	session.open(IptvOrgPlaylists)
+
 
 def Plugins(**kwargs):
-	return [PluginDescriptor(name="iptv-org playlists", description=_("Make IPTV bouquets based on m3u playlists from github.com/iptv-org"), where=PluginDescriptor.WHERE_PLUGINMENU, needsRestart=True, fnc=PluginMain)]
+	return [
+		PluginDescriptor(
+			name=_("iptv-org playlists"),
+			description=_("Make IPTV bouquets with EPGImport support from ://github.com"),
+			where=PluginDescriptor.WHERE_PLUGINMENU,
+			fnc=main,
+		)
+	]
