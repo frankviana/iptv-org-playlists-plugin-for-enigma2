@@ -1,0 +1,29 @@
+name: Build Enigma2 IPK
+on: [push, workflow_dispatch]
+jobs:
+  build-ipk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build IPK package
+        run: |
+          mkdir -p pkg/CONTROL pkg/usr/lib/enigma2/python/Plugins/Extensions/iptv-org-playlists
+          cp -r src/* pkg/usr/lib/enigma2/python/Plugins/Extensions/iptv-org-playlists/ 2>/dev/null || cp -r *.py locale pkg/usr/lib/enigma2/python/Plugins/Extensions/iptv-org-playlists/
+          cat << 'EOF' > pkg/CONTROL/control
+          Package: enigma2-plugin-extensions-iptv-org-playlists
+          Version: 1.0+custom
+          Description: Make IPTV bouquets based on m3u playlists from ://github.com (Custom Fork)
+          Section: base
+          Priority: optional
+          Maintainer: Frank Viana
+          Architecture: all
+          Depends: python3-requests
+          EOF
+          echo "2.0" > pkg/debian-binary
+          tar -czf pkg/control.tar.gz -C pkg/CONTROL .
+          tar -czf pkg/data.tar.gz -C pkg usr
+          (cd pkg && ar r ../enigma2-plugin-extensions-iptv-org-playlists_1.0+custom_all.ipk debian-binary control.tar.gz data.tar.gz)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iptv-org-playlists-ipk
+          path: "*.ipk"
