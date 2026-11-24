@@ -1,7 +1,7 @@
 # for localized messages
 from . import _, group_titles
 
-from os import makedirs as os_makedirs, path as os_path
+from os import makedirs as os_makedirs, path as os_path, remove as os_remove
 from requests import get, exceptions
 from shutil import rmtree
 from time import time
